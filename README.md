@@ -52,3 +52,10 @@ the exact users/files and that the compose file and the replaced data were kept;
 damaged one = FAIL. Test scripts: `tests/`.
 
 MIT licence. Made with AI assistance. Not affiliated with Nextcloud, Jellyfin or Immich.
+
+
+## Support
+
+The tool is free and stays free. If it saved you time, you can leave a tip:
+[![Tip on Ko-fi](https://img.shields.io/badge/Ko--fi-leave%20a%20tip-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/localhaven)
+(optional - nothing is unlocked by it).
