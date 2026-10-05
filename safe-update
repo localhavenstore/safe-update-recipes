@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# safe-update - consistent DATA snapshots before a container update, and a restore that puts data + image back together.
+#   safe-update plan     APP COMPOSE_DIR [--to TAG]   read-only: what would be saved, upgrade-path check, free disk
+#   safe-update snapshot APP COMPOSE_DIR [--to TAG]   take a consistent snapshot into COMPOSE_DIR/.safe-update/<UTC>/
+#   safe-update restore  APP COMPOSE_DIR SNAPSHOT [--yes]   without --yes: prints the steps only
+#   safe-update drill    APP COMPOSE_DIR [SNAPSHOT]   restore into a THROWAWAY copy (own project name, no ports) + app check
+#   safe-update list     APP COMPOSE_DIR               snapshots, newest first
+# Never deletes a snapshot. Never downloads anything (no curl/wget; the update itself is yours or PRO's).
+# Recipes: recipes/<app>.sh. Tested app versions are listed in each recipe. MIT licence. Made with AI assistance.
+set -euo pipefail
+VERSION=0.1.0
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+die() { echo "safe-update: $*" >&2; exit 1; }
+say() { echo "$*"; }
+log() { [[ -n ${LOGF:-} ]] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOGF"; say "$*"; }
+
+[[ $# -ge 3 ]] || { sed -n '2,10p' "$0"; exit 64; }
+CMD=$1 APP=$2 DIR=$(readlink -f "$3"); shift 3
+[[ $APP =~ ^[a-z0-9-]+$ && -f $HERE/recipes/$APP.sh ]] || die "no recipe for '$APP' (have: $(ls "$HERE/recipes" | sed 's/\.sh$//' | tr '\n' ' '))"
+[[ -d $DIR ]] || die "$DIR is not a directory"
+COMPOSE_FILE=""
+for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do [[ -f $DIR/$f ]] && { COMPOSE_FILE=$DIR/$f; break; }; done
+[[ -n $COMPOSE_FILE ]] || die "no compose file in $DIR"
+SNAPROOT=$DIR/.safe-update
+TO="" YES=0 SNAP=""
+while [[ $# -gt 0 ]]; do
+  case $1 in --to) TO=${2:?}; shift 2 ;; --yes) YES=1; shift ;; -*) die "unknown option $1" ;; *) SNAP=$1; shift ;; esac
+done
+DC() { docker compose -f "$COMPOSE_FILE" --project-directory "$DIR" "$@" </dev/null; }
+
+# ---- helpers available to recipes
+svc_container() { DC ps -q "$1" 2>/dev/null | head -1; }                       # running container id of a service
+svc_image() { DC config --format json | python3 -c "import json,sys;print(json.load(sys.stdin)['services']['$1'].get('image',''))"; }
+svc_digest() { local c; c=$(DC ps -aq "$1" | head -1); [[ -n $c ]] && docker inspect -f '{{.Image}}' "$c"; }
+svc_mount() {  # host path of the bind mount at container path $2 in service $1 ('' if a named volume)
+  DC config --format json | python3 -c "
+import json,sys
+c=json.load(sys.stdin); s=c['services']['$1']
+for v in s.get('volumes',[]):
+    if isinstance(v,dict) and v.get('target')=='$2':
+        src=v.get('source','')
+        if v.get('type')=='bind': print(src)
+        else: print('volume:'+((c.get('volumes') or {}).get(src) or {}).get('name', src))   # real name, e.g. <project>_html
+        break"
+}
+bytes_of() { du -sb "$@" 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+human() { numfmt --to=iec "${1:-0}" 2>/dev/null || echo "$1 B"; }
+tag_of() { local i=$1; [[ $i == *@* ]] && i=${i%@*}; [[ ${i##*/} == *:* ]] && echo "${i##*:}" || echo latest; }
+
+# shellcheck source=/dev/null
+source "$HERE/recipes/$APP.sh"
+for fn in recipe_detect recipe_guard recipe_size recipe_snapshot recipe_restore_data recipe_check recipe_drill; do
+  declare -F "$fn" >/dev/null || die "recipe $APP misses $fn"
+done
+
+need_space() {  # $1 = bytes the snapshot needs; refuse below 2x
+  local free; free=$(df -PB1 "$DIR" | awk 'NR==2{print $4}')
+  (( free >= 2 * $1 )) || die "not enough free disk: snapshot needs ~$(human "$1"), free $(human "$free") (need 2x) - nothing changed"
+}
+
+write_manifest() {  # $1 = snapshot dir
+  python3 - "$1" "$APP" "$VERSION" "$COMPOSE_FILE" "${RECIPE_SERVICES[@]}" <<'PY'
+import json, os, subprocess, sys, time, hashlib
+d, app, ver, cf, *svcs = sys.argv[1:]
+files = {}
+for root, _, names in os.walk(d):
+    for n in names:
+        p = os.path.join(root, n)
+        if n in ("manifest.json", "COMPLETE"):
+            continue
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        files[os.path.relpath(p, d)] = {"size": os.path.getsize(p), "sha256": h.hexdigest()}
+imgs = {}
+for s in svcs:
+    r = subprocess.run(["docker", "compose", "-f", cf, "ps", "-aq", s], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    cid = r.stdout.split()[0] if r.stdout.split() else ""
+    if cid:
+        iid, ref = subprocess.run(["docker", "inspect", "-f", "{{.Image}}|{{.Config.Image}}", cid], capture_output=True, text=True).stdout.strip().split("|")
+        rd = subprocess.run(["docker", "image", "inspect", "-f", "{{join .RepoDigests \" \"}}", iid], capture_output=True, text=True).stdout.split()
+        imgs[s] = {"id": iid, "ref": ref, "repo_digests": rd}
+json.dump({"app": app, "tool_version": ver, "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "compose_file": cf, "images": imgs, "files": files}, open(os.path.join(d, "manifest.json"), "w"), indent=1)
+PY
+}
+
+verify_snapshot() {  # $1 = snapshot dir -> 0 if complete and every file matches its sha256
+  [[ -f $1/COMPLETE && -f $1/manifest.json ]] || { say "snapshot $1 is INCOMPLETE (no COMPLETE marker)"; return 1; }
+  python3 - "$1" <<'PY'
+import hashlib, json, os, sys
+d = sys.argv[1]; m = json.load(open(os.path.join(d, "manifest.json"))); bad = []
+for rel, meta in m["files"].items():
+    p = os.path.join(d, rel)
+    if not os.path.isfile(p) or os.path.getsize(p) != meta["size"]:
+        bad.append(rel); continue
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    if h.hexdigest() != meta["sha256"]:
+        bad.append(rel)
+print("snapshot files verified" if not bad else "snapshot DAMAGED: " + ", ".join(bad[:5]))
+sys.exit(1 if bad else 0)
+PY
+}
+
+latest_snapshot() { ls -1d "$SNAPROOT"/2*/ 2>/dev/null | sort | tail -1 | sed 's:/$::'; }
+
+recipe_detect                                     # sets RECIPE_SERVICES + recipe variables, dies if the stack does not match
+case $CMD in
+  plan)
+    say "safe-update $VERSION - $APP in $DIR"
+    say "services: ${RECIPE_SERVICES[*]}"
+    for s in "${RECIPE_SERVICES[@]}"; do say "  $s: $(svc_image "$s")"; done
+    recipe_guard "$TO" || true
+    need=$(recipe_size)
+    say "snapshot would take ~$(human "$need"); free disk: $(human "$(df -PB1 "$DIR" | awk 'NR==2{print $4}')") (need 2x)"
+    say "plan only - nothing changed." ;;
+  snapshot)
+    recipe_guard "$TO" || die "upgrade path refused (see above) - nothing changed"
+    need_space "$(recipe_size)"
+    ts=$(date -u +%Y%m%dT%H%M%SZ); S=$SNAPROOT/$ts
+    install -d -m 0700 "$SNAPROOT"; mkdir -m 0700 "$S"; LOGF=$SNAPROOT/log
+    log "snapshot $APP -> $S"
+    mkdir -m 0700 "$S/compose"; cp -a "$COMPOSE_FILE" "$S/compose/"; [[ -f $DIR/.env ]] && cp -a "$DIR/.env" "$S/compose/"
+    recipe_snapshot "$S"
+    write_manifest "$S"; touch "$S/COMPLETE"
+    verify_snapshot "$S" >/dev/null || die "snapshot did not verify - see $S"
+    log "snapshot COMPLETE: $S ($(human "$(bytes_of "$S")"))" ;;
+  list)
+    ls -1d "$SNAPROOT"/2*/ 2>/dev/null | sort -r | while read -r s; do
+      s=${s%/}; printf '%s  %s  %s\n' "${s##*/}" "$( [[ -f $s/COMPLETE ]] && echo complete || echo INCOMPLETE)" "$(human "$(bytes_of "$s")")"
+    done ;;
+  restore)
+    S=${SNAP:-$(latest_snapshot)}; [[ $S == /* ]] || S=$SNAPROOT/$S
+    [[ -d $S ]] || die "no snapshot $S"
+    verify_snapshot "$S" || die "refusing to restore from a damaged snapshot"
+    if [[ $YES != 1 ]]; then
+      say "DRY RUN - would: stop ${RECIPE_SERVICES[*]}; put the images back as recorded in $S/manifest.json;"
+      say "  put the compose file (+ .env) and the data saved in $S back (the current ones are saved first in $S.replaced-<time>,"
+      say "  never deleted); start without pulling; app check."
+      say "Run again with --yes to do it."; exit 0
+    fi
+    LOGF=$SNAPROOT/log; log "restore $APP from $S"
+    while IFS='|' read -r id ref rds; do
+      [[ -n $id ]] || continue
+      docker image inspect "$id" >/dev/null 2>&1 || die "the previous image $ref (${id:7:12}) is no longer on this machine (pruned?). Get it back first: docker pull ${rds%% *} - then run restore again. Nothing restored yet."
+    done < <(python3 -c 'import json,sys
+for v in json.load(open(sys.argv[1]))["images"].values(): print(v["id"]+"|"+v["ref"]+"|"+" ".join(v["repo_digests"]))' "$S/manifest.json")
+    DC stop "${RECIPE_SERVICES[@]}" >/dev/null
+    R=$S.replaced-$(date -u +%Y%m%dT%H%M%SZ); mkdir -m 0700 "$R"
+    cp -a "$COMPOSE_FILE" "$R/"; [[ -f $DIR/.env ]] && cp -a "$DIR/.env" "$R/"
+    cp -a "$S/compose/$(basename "$COMPOSE_FILE")" "$COMPOSE_FILE"; [[ -f $S/compose/.env ]] && cp -a "$S/compose/.env" "$DIR/.env"
+    log "compose file (+ .env) back as in the snapshot; the current ones kept in $R"
+    while IFS='|' read -r id ref; do
+      [[ -n $id && $ref != *@* ]] && docker image tag "$id" "$ref" && log "image $ref -> ${id:7:12}"
+    done < <(python3 -c 'import json,sys
+for v in json.load(open(sys.argv[1]))["images"].values(): print(v["id"]+"|"+v["ref"])' "$S/manifest.json")
+    recipe_restore_data "$S" "$R"
+    DC up -d --pull never "${RECIPE_SERVICES[@]}" >/dev/null
+    recipe_check && log "restore OK - app check passed" || die "restore done but the app check FAILED - see $SNAPROOT/log" ;;
+  drill)
+    S=${SNAP:-$(latest_snapshot)}; [[ $S == /* ]] || S=$SNAPROOT/$S
+    [[ -d $S ]] || die "no snapshot to drill"
+    verify_snapshot "$S" || die "drill FAILED: snapshot damaged"
+    LOGF=$SNAPROOT/log
+    recipe_drill "$S" && log "drill OK: $S restores and the app starts" || die "drill FAILED for $S" ;;
+  *) die "unknown command $CMD" ;;
+esac
