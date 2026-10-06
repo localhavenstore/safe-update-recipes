@@ -1,4 +1,4 @@
-# safe-update (v0.1.2, preview)
+# safe-update (v0.1.3, preview)
 
 **A consistent data snapshot right before a container update - and a restore that puts the data AND the old image back
 together.**
@@ -27,6 +27,7 @@ sudo ./safe-update check    nextcloud /srv/nextcloud                  # read-onl
 | Immich (machine learning optional) | services stopped -> full database dump (`pg_dumpall --clean --if-exists`, as in Immich's docs) + an inventory of the library (photos are NOT copied) | no downgrades, one major at a time | `/api/server/ping` + version |
 | Vaultwarden (SQLite) | service stopped -> `/data` (database, attachments, sends, keys, config) | refuses data outside `/data`, external databases, `ENV_FILE`, nested mounts | `/alive` + version + database present |
 | n8n (SQLite) | service stopped -> `/home/node/.n8n` (database, encryption key config, binary data) | refuses PostgreSQL, data outside the folder, S3/Azure storage, `*_FILE` secrets, nested mounts; 2.x -> 3.x note | `/healthz` + version; the drill also decrypts the credentials |
+| Home Assistant (Container, SQLite recorder) | container stopped -> `/config` (configuration, `.storage`, recorder database after an integrity check) | refuses any `db_url` that is not the default recorder file (other databases, other paths - also via `!include`, packages, secrets), nested mounts | web server answers + version; recorder database healthy (quick check + no recorder error in the log) |
 
 ## Rules it keeps
 - **Never downloads anything.** No curl/wget in the scripts; restore uses the images still on your machine (it tells
@@ -56,10 +57,15 @@ sudo ./safe-update check    nextcloud /srv/nextcloud                  # read-onl
 | Immich (+ its postgres image, valkey) | v3.1.0 -> v3.0.3 refused; v3.1.0 -> snapshot -> v3.2.4 (migration) + a new photo -> restore to 3.1.0 (1 asset; the newer photo's file kept and reported) | 10/10 |
 | Vaultwarden | 1.37.2 -> 1.37.3 (invited user kept), sqlite URL accepted, relocations refused | 7/7 (r4) + update test |
 | n8n | 2.41.6 -> 2.41.7 and 2.41.7 -> the v3 release-candidate image (workflow kept); key only in the environment + credential -> drill decrypts | 7/7 (r4) + update tests |
+| Home Assistant | 2026.9.3 -> 2026.9.4 (user kept); PostgreSQL recorder via `!include` refused; SQLite recorder in a package accepted | 3/3 (r5) + update test |
 
 Each run: seed real data, snapshot, real major update, add data on the new version, restore, then check the version,
 the exact users/files and that the compose file and the replaced data were kept; drill on a good snapshot = OK, on a
 damaged one = FAIL (Immich also: a dump with a real SQL error = FAIL). Test scripts: `tests/`.
+
+## Changes in 0.1.3 (6 Oct 2026)
+- New recipe: **Home Assistant** (Container installs with the default SQLite recorder). Home Assistant OS / Supervised:
+  use Home Assistant's own backups.
 
 ## Changes in 0.1.2 (6 Oct 2026)
 - New recipes: **Vaultwarden** (SQLite) and **n8n** (SQLite). Both refuse setups they cannot fully save (nothing changed).
