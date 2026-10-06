@@ -66,7 +66,11 @@ recipe_snapshot() {
 
 # Immich docs (backup-and-restore): a dump restored with an empty search_path breaks the vector extensions
 _SP_FIX="s/SELECT pg_catalog.set_config('search_path', '', false);/SELECT pg_catalog.set_config('search_path', 'public, pg_catalog', true);/g"
-_load() { sed "$_SP_FIX" "$1" | _db 'psql -q -U "$POSTGRES_USER" -d postgres >/dev/null 2>/tmp/safe-update-load.err; tail -3 /tmp/safe-update-load.err >&2; exit 0'; }
+# pg_dumpall --clean always gives 2 harmless errors on load (the superuser that runs it cannot be dropped / already exists);
+# ANY other error = the restore failed (never reported as restored)
+_load() { sed "$_SP_FIX" "$1" | _db 'psql -q -U "$POSTGRES_USER" -d postgres >/dev/null 2>/tmp/safe-update-load.err; rc=$?
+  bad=$(grep "ERROR:" /tmp/safe-update-load.err | grep -v -e "current user cannot be dropped" -e "role \"$POSTGRES_USER\" already exists")
+  if [ "$rc" -ne 0 ] || [ -n "$bad" ]; then echo "database load FAILED (psql rc=$rc):" >&2; printf "%s\n" "$bad" | head -5 >&2; exit 1; fi'; }
 
 recipe_restore_data() {
   local S=$1 R=$2 img now new
@@ -74,7 +78,7 @@ recipe_restore_data() {
   local up=("$IM_DB"); [[ -n $IM_REDIS ]] && up+=("$IM_REDIS")
   DC up -d --pull never "${up[@]}" >/dev/null; _db_wait || die "the database did not start - nothing restored yet"
   _db 'pg_dumpall --clean --if-exists -U "$POSTGRES_USER"' </dev/null > "$R/db-replaced.sql" && [[ -s $R/db-replaced.sql ]] || die "could not save the current database first - nothing restored"
-  _load "$S/db.sql"
+  _load "$S/db.sql" || die "loading the saved database failed - the database before this step is in $R/db-replaced.sql"
   log "immich: database restored (the replaced one is in $R/db-replaced.sql)"
   _inventory "$img" > "$R/library-now.tsv"
   new=$(comm -13 <(cut -f1 "$S/library-inventory.tsv" | sort) <(cut -f1 "$R/library-now.tsv" | sort) | wc -l)
@@ -110,14 +114,14 @@ for s,f in ((sys.argv[1],sys.argv[3]),(sys.argv[2],sys.argv[4])):
     -c 'while read -r p; do mkdir -p "/d/$(dirname "$p")" && touch "/d/$p"; done' || ok=0
   docker run -d --name "$t-db" --network "$t-net" --network-alias "$IM_DB" --env-file "$envd" -v "$t-db":/var/lib/postgresql/data "$dimg" >/dev/null
   docker run -d --name "$t-redis" --network "$t-net" --network-alias "$IM_REDIS" "$rimg" >/dev/null
-  svc_container() { case $1 in "$IM_DB") echo "$t-db" ;; *) DC ps -q "$1" 2>/dev/null | head -1 ;; esac; }
+  svc_container() { case $1 in "$IM_DB") echo "$t-db" ;; *) svc_cids "$1" running | head -1 ;; esac; }
   _db_wait && _load "$S/db.sql" 2>/dev/null || ok=0
   if (( ok )); then
     docker run -d --name "$t-server" --network "$t-net" --env-file "$envs" -e IMMICH_MACHINE_LEARNING_ENABLED=false -v "$t-data":/data "$simg" >/dev/null
     for i in $(seq 1 90); do out=$(_im_api "$t-server" /api/server/ping || true); [[ $out == *pong* ]] && break; sleep 2; done
     [[ $out == *pong* ]] || ok=0
   fi
-  svc_container() { DC ps -q "$1" 2>/dev/null | head -1; }
+  svc_container() { svc_cids "$1" running | head -1; }
   docker rm -f "$t-server" "$t-redis" "$t-db" >/dev/null 2>&1; docker volume rm "$t-db" "$t-data" >/dev/null 2>&1; docker network rm "$t-net" >/dev/null 2>&1
   rm -f "$envd" "$envs"
   (( ok ))

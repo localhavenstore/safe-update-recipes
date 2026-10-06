@@ -66,6 +66,7 @@ s "$SU restore immich $D; echo rc=\$?" restore-dry
 s "$SU restore immich $D --yes; echo rc=\$?; $P wait_im 1; version; assets; grep immich-server: $D/compose.yaml" restore
 s "$SU drill immich $D; echo rc=\$?" drill-good
 s "S=\$(sudo sh -c 'ls -1d $D/.safe-update/2*Z' | head -1); sudo cp -a \$S $D/.safe-update/29990101T000000Z && sudo truncate -s 5000 $D/.safe-update/29990101T000000Z/db.sql && $SU drill immich $D 29990101T000000Z; echo rc=\$?" drill-damaged
+s "S=\$(sudo sh -c 'ls -1d $D/.safe-update/2*Z' | head -1); B=$D/.safe-update/29990102T000000Z; sudo cp -a \$S \$B && echo 'CREATE TABLE safe_update_bad (x no_such_type);' | sudo tee -a \$B/db.sql >/dev/null && sudo python3 -c \"import json,hashlib,os,sys;b=sys.argv[1];m=json.load(open(b+'/manifest.json'));p=b+'/db.sql';m['files']['db.sql']={'size':os.path.getsize(p),'sha256':hashlib.sha256(open(p,'rb').read()).hexdigest()};json.dump(m,open(b+'/manifest.json','w'))\" \$B && $SU drill immich $D 29990102T000000Z; echo rc=\$?" drill-bad-sql
 s "grep -nE '\\b(curl|wget)\\b' /home/learner/sur/safe-update /home/learner/sur/recipes/*.sh | grep -v 'docker exec' | grep -vE ':[0-9]+: *#' ; echo end" no-download
 chk() { if eval "$2"; then echo "PASS $1" | tee -a "$OUT/summary.txt"; else echo "FAIL $1" | tee -a "$OUT/summary.txt"; fi; }
 chk "seed: admin + 1 photo on 3.1" "grep -q '^3.1' '$OUT/start.txt' && grep -q 'assets 1' '$OUT/seed.txt'"
@@ -76,4 +77,5 @@ chk "restore dry-run" "grep -q 'DRY RUN' '$OUT/restore-dry.txt'"
 chk "restore: 3.1 + 1 asset + compose back + photo 2 file reported (kept), none missing" "grep -q 'restore OK' '$OUT/restore.txt' && grep -q '^3.1' '$OUT/restore.txt' && grep -q 'assets 1' '$OUT/restore.txt' && grep -q 'immich-server:v3.1.0' '$OUT/restore.txt' && grep -qE '[1-9][0-9]* file\\(s\\) added after the snapshot' '$OUT/restore.txt' && grep -q ', 0 file(s) from the snapshot MISSING' '$OUT/restore.txt'"
 chk "drill good = OK" "grep -q 'drill OK' '$OUT/drill-good.txt'"
 chk "drill damaged = FAIL" "grep -qE 'DAMAGED|drill FAILED' '$OUT/drill-damaged.txt' && grep -q 'rc=1' '$OUT/drill-damaged.txt'"
+chk "drill on a dump with a real SQL error = FAIL (not silently 'OK')" "grep -q 'drill FAILED' '$OUT/drill-bad-sql.txt' && grep -q 'rc=1' '$OUT/drill-bad-sql.txt'"
 chk "scripts never download" "grep -qx end '$OUT/no-download.txt' && [ \$(wc -l < '$OUT/no-download.txt') = 1 ]"

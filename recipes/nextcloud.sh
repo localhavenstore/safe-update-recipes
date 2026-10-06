@@ -163,7 +163,7 @@ recipe_drill() {  # throwaway copy: own network (internal) + volumes, recorded i
     docker run -d --name "$t-db" --network "$net" --network-alias "$DB_SVC" --env-file "$envd" -v "$vold":"$dbdir" "$dimg" >/dev/null
     svc_container() { echo "$t-db"; }   # point the DB helpers at the drill container
     _db_wait && _load_from "$S/db.sql" || ok=0
-    unset -f svc_container; svc_container() { DC ps -q "$1" 2>/dev/null | head -1; }
+    unset -f svc_container; svc_container() { svc_cids "$1" running | head -1; }
   fi
   if (( ok )); then
     docker run -d --name "$t-nc" --network "$net" --env-file "$envn" -v "$vol":/var/www/html $([[ -f $S/data.tar ]] && echo "-v $t-data:/var/www/html/data") "$nimg" >/dev/null

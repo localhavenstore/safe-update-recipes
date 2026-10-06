@@ -1,4 +1,4 @@
-# safe-update (v0.1, preview)
+# safe-update (v0.1.1, preview)
 
 **A consistent data snapshot right before a container update - and a restore that puts the data AND the old image back
 together.**
@@ -15,6 +15,8 @@ sudo ./safe-update snapshot nextcloud /srv/nextcloud --to 35-apache   # consiste
 sudo ./safe-update restore  nextcloud /srv/nextcloud                  # dry run: prints the steps
 sudo ./safe-update restore  nextcloud /srv/nextcloud --yes            # data + compose file + old image back, app check
 sudo ./safe-update drill    nextcloud /srv/nextcloud                  # proves a snapshot restores (throwaway copy, no ports)
+sudo ./safe-update check    nextcloud /srv/nextcloud                  # read-only: the app check on the running stack (0 = OK)
+./safe-update --version
 ```
 
 ## What each recipe does
@@ -37,6 +39,10 @@ sudo ./safe-update drill    nextcloud /srv/nextcloud                  # proves a
 - **Not a backup strategy.** Snapshots live on the same disk, next to your compose file. Keep real backups elsewhere.
 - Photos/media are not copied by the Immich and Jellyfin recipes (too big; updates do not change them).
 - The app is stopped for the copy (minutes for big Nextcloud data folders). External storage is not included.
+- **One compose file.** safe-update reads only `compose.yaml` (or `docker-compose.yml`); with a `compose.override.yaml`
+  next to it, snapshot refuses (nothing changed) instead of saving the wrong data.
+- **One tool at a time per stack.** safe-update locks a stack for its own snapshot, restore and drill, but it cannot
+  see other tools: do not run another update/backup tool on the same stack while it works.
 - Tested only with the versions below, on fresh Ubuntu 24.04 VMs with Docker's Ubuntu packages.
 
 ## Tested (automated VM runs, real images)
@@ -45,11 +51,29 @@ sudo ./safe-update drill    nextcloud /srv/nextcloud                  # proves a
 | Jellyfin | 10.11.10 -> 12.1 refused; 10.11.10 -> 10.11.11 -> snapshot -> 12.1 (migration) -> restore to 10.11.11 | 9/9 |
 | Nextcloud + PostgreSQL 17 | 34 -> 36 refused; 34 -> snapshot -> 35.0.1 (migration) -> restore to 34.0.4 | 9/9 |
 | Nextcloud + MariaDB 11.4 | same path | 9/9 |
-| Immich (+ its postgres image, valkey) | v3.1.0 -> v3.0.3 refused; v3.1.0 -> snapshot -> v3.2.4 (migration) + a new photo -> restore to 3.1.0 (1 asset; the newer photo's file kept and reported) | 9/9 |
+| Immich (+ its postgres image, valkey) | v3.1.0 -> v3.0.3 refused; v3.1.0 -> snapshot -> v3.2.4 (migration) + a new photo -> restore to 3.1.0 (1 asset; the newer photo's file kept and reported) | 10/10 |
 
 Each run: seed real data, snapshot, real major update, add data on the new version, restore, then check the version,
 the exact users/files and that the compose file and the replaced data were kept; drill on a good snapshot = OK, on a
-damaged one = FAIL. Test scripts: `tests/`.
+damaged one = FAIL (Immich also: a dump with a real SQL error = FAIL). Test scripts: `tests/`.
+
+## Changes in 0.1.1 (5 Oct 2026)
+- **Fix (Immich):** in 0.1 the Immich restore and drill ignored errors while loading the database dump, so a load that
+  failed part-way could still be reported as restored. Now only the two harmless messages every `pg_dumpall --clean`
+  load prints are accepted; any other error stops the restore (the database before it stays saved) and fails the drill.
+  If you restored Immich with 0.1: run `safe-update check immich DIR` and a `drill` on the snapshot you used.
+  Nextcloud and Jellyfin were not affected (their loads already stopped on the first error).
+- **Fix (restore):** restore now reads services and data folders from the snapshot's OWN copy of the compose file and
+  `.env`, not from the current ones (a volume changed in `.env` after the snapshot could otherwise receive the old data).
+  A `.env` the snapshot did not have is removed and kept in the replaced folder.
+- safe-update runs `docker compose` with a clean environment (as `sudo` does by default): only the compose file and
+  `.env` decide images, folders and settings - variables exported in your shell are ignored. `snapshot` refuses
+  (nothing changed) when the compose file + `.env` do not describe the running stack (for example a stack started
+  with a shell variable that `.env` does not have - checked: image, folders/volumes and environment): put the variable
+  into `.env` first.
+- Snapshot, restore and drill lock the stack, so two safe-update runs cannot work on it at once.
+- New: `safe-update check APP DIR` (read-only app check), `safe-update app-service APP DIR` (prints the service the
+  recipe treats as the app) and `safe-update --version`.
 
 MIT licence. Made with AI assistance. Not affiliated with Nextcloud, Jellyfin or Immich.
 

@@ -5,16 +5,19 @@
 #   safe-update restore  APP COMPOSE_DIR SNAPSHOT [--yes]   without --yes: prints the steps only
 #   safe-update drill    APP COMPOSE_DIR [SNAPSHOT]   restore into a THROWAWAY copy (own project name, no ports) + app check
 #   safe-update list     APP COMPOSE_DIR               snapshots, newest first
+#   safe-update check    APP COMPOSE_DIR               read-only: the recipe's app check on the running stack (0 = OK)
+#   safe-update app-service APP COMPOSE_DIR            read-only: prints the service the recipe treats as the app
 # Never deletes a snapshot. Never downloads anything (no curl/wget; the update itself is yours or PRO's).
 # Recipes: recipes/<app>.sh. Tested app versions are listed in each recipe. MIT licence. Made with AI assistance.
 set -euo pipefail
-VERSION=0.1.0
+VERSION=0.1.1
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { echo "safe-update: $*" >&2; exit 1; }
 say() { echo "$*"; }
 log() { [[ -n ${LOGF:-} ]] && printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOGF"; say "$*"; }
 
-[[ $# -ge 3 ]] || { sed -n '2,10p' "$0"; exit 64; }
+[[ ${1:-} == --version ]] && { echo "safe-update $VERSION"; exit 0; }
+[[ $# -ge 3 ]] || { sed -n '2,12p' "$0"; exit 64; }
 CMD=$1 APP=$2 DIR=$(readlink -f "$3"); shift 3
 [[ $APP =~ ^[a-z0-9-]+$ && -f $HERE/recipes/$APP.sh ]] || die "no recipe for '$APP' (have: $(ls "$HERE/recipes" | sed 's/\.sh$//' | tr '\n' ' '))"
 [[ -d $DIR ]] || die "$DIR is not a directory"
@@ -26,12 +29,23 @@ TO="" YES=0 SNAP=""
 while [[ $# -gt 0 ]]; do
   case $1 in --to) TO=${2:?}; shift 2 ;; --yes) YES=1; shift ;; -*) die "unknown option $1" ;; *) SNAP=$1; shift ;; esac
 done
-DC() { docker compose -f "$COMPOSE_FILE" --project-directory "$DIR" "$@" </dev/null; }
+ENV_FILE=""                                       # restore: read the SNAPSHOT's .env instead of the current one
+# docker compose ALWAYS with a clean environment (like sudo's default): only the compose file + .env decide images,
+# mounts and container settings - a variable exported in the caller's shell can never change what is snapshotted/restored
+CLEAN=(env -i PATH="$PATH" HOME="$HOME")
+for v in DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG DOCKER_CERT_PATH DOCKER_TLS_VERIFY; do [[ -n ${!v:-} ]] && CLEAN+=("$v=${!v}"); done
+DC() { "${CLEAN[@]}" docker compose -f "$COMPOSE_FILE" --project-directory "$DIR" ${ENV_FILE:+--env-file "$ENV_FILE"} "$@" </dev/null; }
 
 # ---- helpers available to recipes
-svc_container() { DC ps -q "$1" 2>/dev/null | head -1; }                       # running container id of a service
+svc_cids() {  # $1 = service [$2 = running]: its compose containers WITHOUT one-off 'docker compose run' ones
+  local c f=-aq; [[ ${2:-} == running ]] && f=-q
+  for c in $(DC ps $f "$1" 2>/dev/null); do
+    [[ $(docker inspect -f '{{index .Config.Labels "com.docker.compose.oneoff"}}' "$c" 2>/dev/null) == True ]] || echo "$c"
+  done
+}
+svc_container() { svc_cids "$1" running | head -1; }                         # running container id of a service
 svc_image() { DC config --format json | python3 -c "import json,sys;print(json.load(sys.stdin)['services']['$1'].get('image',''))"; }
-svc_digest() { local c; c=$(DC ps -aq "$1" | head -1); [[ -n $c ]] && docker inspect -f '{{.Image}}' "$c"; }
+svc_digest() { local c; c=$(svc_cids "$1" | head -1); [[ -n $c ]] && docker inspect -f '{{.Image}}' "$c"; }
 svc_mount() {  # host path of the bind mount at container path $2 in service $1 ('' if a named volume)
   DC config --format json | python3 -c "
 import json,sys
@@ -42,6 +56,64 @@ for v in s.get('volumes',[]):
         if v.get('type')=='bind': print(src)
         else: print('volume:'+((c.get('volumes') or {}).get(src) or {}).get('name', src))   # real name, e.g. <project>_html
         break"
+}
+stack_shape() {  # project name + every service's image and mounts (real volume names) as compose resolves them NOW
+  local cfg
+  cfg=$(DC config --format json) || return 1
+  python3 -c '
+import json,sys
+c=json.load(sys.stdin); vols=c.get("volumes") or {}; out={"name":c.get("name"),"services":{}}
+for n,s in sorted((c.get("services") or {}).items()):
+    m=[]
+    for v in s.get("volumes",[]):
+        if isinstance(v,dict):
+            src=v.get("source","")
+            if v.get("type")=="volume" and src in vols: src="volume:"+((vols[src] or {}).get("name") or src)
+            m.append([v.get("type"),src,v.get("target")])
+    out["services"][n]={"image":s.get("image",""),"mounts":sorted(m)}
+print(json.dumps(out,sort_keys=True))' <<<"$cfg"
+}
+running_matches() {  # every running recipe container = the image, mounts and environment the compose file (+ .env) resolve to
+  local cfg shape s c id want bad="" f
+  for f in compose.override.yaml compose.override.yml docker-compose.override.yaml docker-compose.override.yml; do
+    [[ -f $DIR/$f ]] && { echo "$f exists: override files are not supported (safe-update reads only $(basename "$COMPOSE_FILE"))"; return 1; }
+  done
+  cfg=$(DC config --format json) && shape=$(stack_shape) || { echo "cannot resolve the compose file"; return 1; }
+  for s in "${RECIPE_SERVICES[@]}"; do
+    local cs; cs=$(svc_cids "$s")                              # ALL its containers (also stopped), no one-off ones
+    [[ -n $cs ]] || { bad+="$s: no container found (create it with 'docker compose up -d' first); "; continue; }
+    for c in $cs; do
+      id=$(docker inspect -f '{{.Config.Image}}' "$c"); want=$(svc_image "$s")   # the reference it was started from
+      [[ $id == "$want" ]] || bad+="$s: was started from $id, the compose file says $want; "
+      r=$(python3 -c '
+import json, os, re, sys
+shape = json.loads(sys.argv[1]); cfg = json.loads(sys.argv[2]); svc = sys.argv[3]; ins = json.loads(sys.argv[4])[0]
+img_env = dict(x.split("=", 1) for x in (json.loads(sys.argv[5])[0]["Config"].get("Env") or []) if "=" in x)
+rp = lambda t, x: os.path.realpath(x) if t == "bind" else x
+want = {(t, rp(t, src), dst) for t, src, dst in shape["services"][svc]["mounts"] if t in ("bind", "volume") and src not in ("", "volume:")}
+have = set()
+for m in ins.get("Mounts") or []:
+    if m["Type"] == "bind": have.add(("bind", rp("bind", m["Source"]), m["Destination"]))
+    elif m["Type"] == "volume":
+        if re.fullmatch(r"[0-9a-f]{64}", m.get("Name", "")): continue      # anonymous volume of the image (not data the user mapped)
+        have.add(("volume", "volume:" + m.get("Name", ""), m["Destination"]))
+out = []
+if want != have:
+    miss = sorted(d for _, _, d in want - have); extra = sorted(d for _, _, d in have - want)
+    out.append(f"{svc}: its folders/volumes differ from the compose file (missing {miss}, extra {extra})")
+env = cfg["services"][svc].get("environment") or {}
+env = env if isinstance(env, dict) else dict(x.split("=", 1) for x in env if "=" in x)
+run = dict(x.split("=", 1) for x in (ins["Config"].get("Env") or []) if "=" in x)
+diff = sorted(k for k, v in env.items() if v is not None and run.get(k) != str(v))   # names only, never values
+diff += sorted(k for k, v in run.items() if k not in env and img_env.get(k) != v)     # extra runtime variables (not compose, not image default)
+names = ", ".join(diff)
+if diff: out.append(f"{svc}: environment differs from the compose file + .env ({names})")
+print("CHECKED " + "; ".join(out))' "$shape" "$cfg" "$s" "$(docker inspect "$c")" "$(docker image inspect "$(docker inspect -f '{{.Image}}' "$c")")" 2>&1)
+      if [[ $r == "CHECKED "* ]]; then r=${r#CHECKED }; [[ -n $r ]] && bad+="$r; "      # fail closed: no CHECKED line = refuse
+      else bad+="$s: could not compare the running container with the compose file (${r:0:120}); "; fi
+    done
+  done
+  [[ -z $bad ]] || { echo "$bad"; return 1; }
 }
 bytes_of() { du -sb "$@" 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
 human() { numfmt --to=iec "${1:-0}" 2>/dev/null || echo "$1 B"; }
@@ -59,9 +131,10 @@ need_space() {  # $1 = bytes the snapshot needs; refuse below 2x
 }
 
 write_manifest() {  # $1 = snapshot dir
-  python3 - "$1" "$APP" "$VERSION" "$COMPOSE_FILE" "${RECIPE_SERVICES[@]}" <<'PY'
+  local pairs=() s0; for s0 in "${RECIPE_SERVICES[@]}"; do pairs+=("$s0=$(svc_cids "$s0" | head -1)"); done
+  "${CLEAN[@]}" python3 - "$1" "$APP" "$VERSION" "$COMPOSE_FILE" "$DIR" "${ENV_FILE:-}" "${pairs[@]}" <<'PY'
 import json, os, subprocess, sys, time, hashlib
-d, app, ver, cf, *svcs = sys.argv[1:]
+d, app, ver, cf, pdir, envf, *pairs = sys.argv[1:]
 files = {}
 for root, _, names in os.walk(d):
     for n in names:
@@ -74,15 +147,20 @@ for root, _, names in os.walk(d):
                 h.update(b)
         files[os.path.relpath(p, d)] = {"size": os.path.getsize(p), "sha256": h.hexdigest()}
 imgs = {}
+svcs, cids = [], {}
+for pair in pairs:                                     # "service=container id" chosen in bash by svc_cids (no one-off containers)
+    s, _, cid = pair.partition("="); svcs.append(s); cids[s] = cid
 for s in svcs:
-    r = subprocess.run(["docker", "compose", "-f", cf, "ps", "-aq", s], capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    cid = r.stdout.split()[0] if r.stdout.split() else ""
+    cid = cids[s]
     if cid:
         iid, ref = subprocess.run(["docker", "inspect", "-f", "{{.Image}}|{{.Config.Image}}", cid], capture_output=True, text=True).stdout.strip().split("|")
         rd = subprocess.run(["docker", "image", "inspect", "-f", "{{join .RepoDigests \" \"}}", iid], capture_output=True, text=True).stdout.split()
         imgs[s] = {"id": iid, "ref": ref, "repo_digests": rd}
 json.dump({"app": app, "tool_version": ver, "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "compose_file": cf, "images": imgs, "files": files}, open(os.path.join(d, "manifest.json"), "w"), indent=1)
+missing = [s for s in svcs if s not in imgs]
+if missing:
+    print("no container/image found for: " + ", ".join(missing), file=sys.stderr); sys.exit(1)
 PY
 }
 
@@ -108,6 +186,9 @@ PY
 
 latest_snapshot() { ls -1d "$SNAPROOT"/2*/ 2>/dev/null | sort | tail -1 | sed 's:/$::'; }
 
+case $CMD in snapshot|restore|drill)              # one changing run per stack at a time (also against compose-update)
+  install -d -m 0700 "$SNAPROOT"; exec 8>"$SNAPROOT/.lock"; flock -n 8 || die "another safe-update run is busy with $DIR - nothing changed" ;;
+esac
 recipe_detect                                     # sets RECIPE_SERVICES + recipe variables, dies if the stack does not match
 case $CMD in
   plan)
@@ -120,15 +201,22 @@ case $CMD in
     say "plan only - nothing changed." ;;
   snapshot)
     recipe_guard "$TO" || die "upgrade path refused (see above) - nothing changed"
+    why=$(running_matches) || die "the compose file + .env do not describe the running stack: $why
+  (started with variables from your shell? put them in .env, run 'docker compose up -d' once, then snapshot) - nothing changed"
     need_space "$(recipe_size)"
     ts=$(date -u +%Y%m%dT%H%M%SZ); S=$SNAPROOT/$ts
     install -d -m 0700 "$SNAPROOT"; mkdir -m 0700 "$S"; LOGF=$SNAPROOT/log
     log "snapshot $APP -> $S"
     mkdir -m 0700 "$S/compose"; cp -a "$COMPOSE_FILE" "$S/compose/"; [[ -f $DIR/.env ]] && cp -a "$DIR/.env" "$S/compose/"
+    stack_shape > "$S/compose/stack-shape.json" || die "cannot resolve the compose file - snapshot incomplete"
     recipe_snapshot "$S"
-    write_manifest "$S"; touch "$S/COMPLETE"
+    write_manifest "$S" || die "snapshot incomplete: the running image of every service must be recorded - see $S"; touch "$S/COMPLETE"
     verify_snapshot "$S" >/dev/null || die "snapshot did not verify - see $S"
     log "snapshot COMPLETE: $S ($(human "$(bytes_of "$S")"))" ;;
+  check)
+    recipe_check ;;
+  app-service)
+    case $APP in nextcloud) echo "$NC_SVC" ;; jellyfin) echo "$JF_SVC" ;; immich) echo "$IM_SVC" ;; *) die "no app service known for $APP" ;; esac ;;
   list)
     ls -1d "$SNAPROOT"/2*/ 2>/dev/null | sort -r | while read -r s; do
       s=${s%/}; printf '%s  %s  %s\n' "${s##*/}" "$( [[ -f $s/COMPLETE ]] && echo complete || echo INCOMPLETE)" "$(human "$(bytes_of "$s")")"
@@ -137,6 +225,18 @@ case $CMD in
     S=${SNAP:-$(latest_snapshot)}; [[ $S == /* ]] || S=$SNAPROOT/$S
     [[ -d $S ]] || die "no snapshot $S"
     verify_snapshot "$S" || die "refusing to restore from a damaged snapshot"
+    # services + mounts as the SNAPSHOT saw them (its compose copy + its .env), not the current files - a changed .env
+    # could point the app at another volume. Dies here, before anything is changed, if that stack cannot be resolved.
+    OLD_SVCS=("${RECIPE_SERVICES[@]}"); REAL_CF=$COMPOSE_FILE
+    COMPOSE_FILE="$S/compose/$(basename "$REAL_CF")"; ENV_FILE="$S/compose/.env"; [[ -f $ENV_FILE ]] || ENV_FILE=/dev/null
+    [[ -f $COMPOSE_FILE ]] || die "snapshot has no copy of $(basename "$REAL_CF") - nothing restored"
+    # the snapshot's own compose + .env (clean environment) must resolve to the shape recorded at snapshot time
+    now=$(stack_shape) || die "cannot resolve the snapshot's compose file - nothing restored"
+    want=$now; [[ -f $S/compose/stack-shape.json ]] && want=$(cat "$S/compose/stack-shape.json")   # 0.1 snapshots: no record
+    [[ $now == "$want" ]] || die "the snapshot's compose file + .env resolve to other images, volumes or project name than
+  when the snapshot was taken (different docker compose version?). Nothing restored."
+    source "$HERE/recipes/$APP.sh"; recipe_detect
+    COMPOSE_FILE=$REAL_CF; ENV_FILE=""
     if [[ $YES != 1 ]]; then
       say "DRY RUN - would: stop ${RECIPE_SERVICES[*]}; put the images back as recorded in $S/manifest.json;"
       say "  put the compose file (+ .env) and the data saved in $S back (the current ones are saved first in $S.replaced-<time>,"
@@ -149,10 +249,14 @@ case $CMD in
       docker image inspect "$id" >/dev/null 2>&1 || die "the previous image $ref (${id:7:12}) is no longer on this machine (pruned?). Get it back first: docker pull ${rds%% *} - then run restore again. Nothing restored yet."
     done < <(python3 -c 'import json,sys
 for v in json.load(open(sys.argv[1]))["images"].values(): print(v["id"]+"|"+v["ref"]+"|"+" ".join(v["repo_digests"]))' "$S/manifest.json")
-    DC stop "${RECIPE_SERVICES[@]}" >/dev/null
+    miss=$(python3 -c 'import json,sys;m=json.load(open(sys.argv[1]))["images"];print(" ".join(s for s in sys.argv[2:] if s not in m))' "$S/manifest.json" "${RECIPE_SERVICES[@]}")
+    [[ -z $miss ]] || die "the snapshot has no image record for: $miss - it cannot put this stack back. Nothing restored."
+    DC stop "${OLD_SVCS[@]}" >/dev/null
     R=$S.replaced-$(date -u +%Y%m%dT%H%M%SZ); mkdir -m 0700 "$R"
     cp -a "$COMPOSE_FILE" "$R/"; [[ -f $DIR/.env ]] && cp -a "$DIR/.env" "$R/"
-    cp -a "$S/compose/$(basename "$COMPOSE_FILE")" "$COMPOSE_FILE"; [[ -f $S/compose/.env ]] && cp -a "$S/compose/.env" "$DIR/.env"
+    cp -a "$S/compose/$(basename "$COMPOSE_FILE")" "$COMPOSE_FILE"
+    if [[ -f $S/compose/.env ]]; then cp -a "$S/compose/.env" "$DIR/.env"
+    elif [[ -f $DIR/.env ]]; then rm -f "$DIR/.env"; log ".env removed: the snapshot had none (a newer .env could pick other images; it is kept in $R)"; fi
     log "compose file (+ .env) back as in the snapshot; the current ones kept in $R"
     while IFS='|' read -r id ref; do
       [[ -n $id && $ref != *@* ]] && docker image tag "$id" "$ref" && log "image $ref -> ${id:7:12}"
