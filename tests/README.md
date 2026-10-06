@@ -11,3 +11,4 @@ They need a small VM helper of your own, given as `TESTVM=/path/to/helper`, with
     TESTVM=~/bin/testvm bash tests/r1_jellyfin_vm.sh
     TESTVM=~/bin/testvm DB=mariadb bash tests/r2_nextcloud_vm.sh      # DB=postgres (default) or mariadb
     TESTVM=~/bin/testvm bash tests/r3_immich_vm.sh
+    TESTVM=~/bin/testvm bash tests/r4_new_recipes_vm.sh      # Vaultwarden + n8n: accepted and refused setups

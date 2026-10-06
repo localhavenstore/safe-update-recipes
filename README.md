@@ -1,4 +1,4 @@
-# safe-update (v0.1.1, preview)
+# safe-update (v0.1.2, preview)
 
 **A consistent data snapshot right before a container update - and a restore that puts the data AND the old image back
 together.**
@@ -25,6 +25,8 @@ sudo ./safe-update check    nextcloud /srv/nextcloud                  # read-onl
 | Nextcloud (PostgreSQL or MariaDB/MySQL) | Nextcloud containers stopped -> database dump made inside the DB container (+ its accounts/owner) -> `/var/www/html` (+ a separate `data` mount) | one major version at a time, no downgrades | `occ status` (installed, not in maintenance) + `occ user:list` |
 | Jellyfin | service stopped -> `/config` (database, settings, plugins, metadata); `/cache` and media are not saved | 10.11.x -> 12.x only from 10.11.11+ | `/health` = Healthy + version |
 | Immich (machine learning optional) | services stopped -> full database dump (`pg_dumpall --clean --if-exists`, as in Immich's docs) + an inventory of the library (photos are NOT copied) | no downgrades, one major at a time | `/api/server/ping` + version |
+| Vaultwarden (SQLite) | service stopped -> `/data` (database, attachments, sends, keys, config) | refuses data outside `/data`, external databases, `ENV_FILE`, nested mounts | `/alive` + version + database present |
+| n8n (SQLite) | service stopped -> `/home/node/.n8n` (database, encryption key config, binary data) | refuses PostgreSQL, data outside the folder, S3/Azure storage, `*_FILE` secrets, nested mounts; 2.x -> 3.x note | `/healthz` + version; the drill also decrypts the credentials |
 
 ## Rules it keeps
 - **Never downloads anything.** No curl/wget in the scripts; restore uses the images still on your machine (it tells
@@ -52,10 +54,15 @@ sudo ./safe-update check    nextcloud /srv/nextcloud                  # read-onl
 | Nextcloud + PostgreSQL 17 | 34 -> 36 refused; 34 -> snapshot -> 35.0.1 (migration) -> restore to 34.0.4 | 9/9 |
 | Nextcloud + MariaDB 11.4 | same path | 9/9 |
 | Immich (+ its postgres image, valkey) | v3.1.0 -> v3.0.3 refused; v3.1.0 -> snapshot -> v3.2.4 (migration) + a new photo -> restore to 3.1.0 (1 asset; the newer photo's file kept and reported) | 10/10 |
+| Vaultwarden | 1.37.2 -> 1.37.3 (invited user kept), sqlite URL accepted, relocations refused | 7/7 (r4) + update test |
+| n8n | 2.41.6 -> 2.41.7 and 2.41.7 -> the v3 release-candidate image (workflow kept); key only in the environment + credential -> drill decrypts | 7/7 (r4) + update tests |
 
 Each run: seed real data, snapshot, real major update, add data on the new version, restore, then check the version,
 the exact users/files and that the compose file and the replaced data were kept; drill on a good snapshot = OK, on a
 damaged one = FAIL (Immich also: a dump with a real SQL error = FAIL). Test scripts: `tests/`.
+
+## Changes in 0.1.2 (6 Oct 2026)
+- New recipes: **Vaultwarden** (SQLite) and **n8n** (SQLite). Both refuse setups they cannot fully save (nothing changed).
 
 ## Changes in 0.1.1 (5 Oct 2026)
 - **Fix (Immich):** in 0.1 the Immich restore and drill ignored errors while loading the database dump, so a load that

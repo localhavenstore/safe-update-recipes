@@ -10,7 +10,7 @@
 # Never deletes a snapshot. Never downloads anything (no curl/wget; the update itself is yours or PRO's).
 # Recipes: recipes/<app>.sh. Tested app versions are listed in each recipe. MIT licence. Made with AI assistance.
 set -euo pipefail
-VERSION=0.1.1
+VERSION=0.1.2
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { echo "safe-update: $*" >&2; exit 1; }
 say() { echo "$*"; }
@@ -216,7 +216,7 @@ case $CMD in
   check)
     recipe_check ;;
   app-service)
-    case $APP in nextcloud) echo "$NC_SVC" ;; jellyfin) echo "$JF_SVC" ;; immich) echo "$IM_SVC" ;; *) die "no app service known for $APP" ;; esac ;;
+    case $APP in nextcloud) echo "$NC_SVC" ;; jellyfin) echo "$JF_SVC" ;; immich) echo "$IM_SVC" ;; vaultwarden) echo "$VW_SVC" ;; n8n) echo "$N8_SVC" ;; *) die "no app service known for $APP" ;; esac ;;
   list)
     ls -1d "$SNAPROOT"/2*/ 2>/dev/null | sort -r | while read -r s; do
       s=${s%/}; printf '%s  %s  %s\n' "${s##*/}" "$( [[ -f $s/COMPLETE ]] && echo complete || echo INCOMPLETE)" "$(human "$(bytes_of "$s")")"
